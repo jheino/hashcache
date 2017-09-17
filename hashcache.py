@@ -9,6 +9,48 @@ import sqlite3
 import sys
 import traceback
 
+class HashCache:
+	def __init__(self, filename):
+		self.connection = sqlite3.connect(filename)
+		self.cursor = self.connection.cursor()
+		self.cursor.execute('PRAGMA synchronous = 0')
+		self.migrate_database()
+		self.connection.commit()
+
+	def migrate_database(self):
+		self.cursor.execute('PRAGMA user_version')
+		user_version = self.cursor.fetchone()[0]
+
+		if user_version < 1:
+			self.cursor.execute('CREATE TABLE digest (dev INTEGER, ino INTEGER, size INTEGER, time INTEGER, md5 BLOB, sha256 BLOB, PRIMARY KEY (dev, ino))')
+			self.cursor.execute('PRAGMA user_version = 1')
+
+	def get(self, filename):
+		statinfo = os.stat(filename)
+
+		self.cursor.execute(
+			'SELECT md5, sha256 FROM digest WHERE dev = ? AND ino = ? AND size = ? AND time = ?',
+			(statinfo.st_dev, statinfo.st_ino, statinfo.st_size, statinfo.st_mtime_ns)
+		)
+		row = self.cursor.fetchone()
+
+		if row is None:
+			logging.info('Hashing: %s', filename)
+			md5, sha256 = get_digests(filename)
+			self.cursor.execute(
+				'INSERT OR REPLACE INTO digest VALUES (?, ?, ?, ?, ?, ?)',
+				(statinfo.st_dev, statinfo.st_ino, statinfo.st_size, statinfo.st_mtime_ns, md5, sha256)
+			)
+			self.connection.commit()
+		else:
+			md5, sha256 = row[0], row[1]
+
+		return md5, sha256
+
+	def close(self):
+		self.cursor.close()
+		self.connection.close()
+
 def get_digests(filename):
 	md5 = hashlib.md5()
 	sha256 = hashlib.sha256()
@@ -23,14 +65,6 @@ def walk(top):
 		for filename in filenames:
 			filepath = os.path.join(dirpath, filename)
 			yield filepath
-
-def migrate_database(cursor):
-	cursor.execute('PRAGMA user_version')
-	user_version = cursor.fetchone()[0]
-
-	if user_version < 1:
-		cursor.execute('CREATE TABLE digest (dev INTEGER, ino INTEGER, size INTEGER, time INTEGER, md5 BLOB, sha256 BLOB, PRIMARY KEY (dev, ino))')
-		cursor.execute('PRAGMA user_version = 1')
 
 def main(argv=None):
 	if argv is None:
@@ -53,11 +87,7 @@ def main(argv=None):
 	parser.add_argument('files', metavar='FILE', nargs='+')
 	args = parser.parse_args(argv)
 
-	connection = sqlite3.connect(args.database)
-	cursor = connection.cursor()
-	cursor.execute('PRAGMA synchronous = 0')
-	migrate_database(cursor)
-	connection.commit()
+	hashcache = HashCache(args.database)
 
 	for arg in args.files:
 		filenames = walk(arg) if os.path.isdir(arg) else [arg]
@@ -72,31 +102,10 @@ def main(argv=None):
 				continue
 
 			try:
-				statinfo = os.stat(filename)
+				md5, sha256 = hashcache.get(filename)
 			except PermissionError:
 				traceback.print_exc()
 				continue
-
-			cursor.execute(
-				'SELECT md5, sha256 FROM digest WHERE dev = ? AND ino = ? AND size = ? AND time = ?',
-				(statinfo.st_dev, statinfo.st_ino, statinfo.st_size, statinfo.st_mtime_ns)
-			)
-			row = cursor.fetchone()
-
-			if row is None:
-				logging.info('Hashing: %s', original_filename)
-				try:
-					md5, sha256 = get_digests(filename)
-				except IOError:
-					traceback.print_exc()
-					continue
-				cursor.execute(
-					'INSERT OR REPLACE INTO digest VALUES (?, ?, ?, ?, ?, ?)',
-					(statinfo.st_dev, statinfo.st_ino, statinfo.st_size, statinfo.st_mtime_ns, md5, sha256)
-				)
-				connection.commit()
-			else:
-				md5, sha256 = row[0], row[1]
 
 			if args.print:
 				if args.print == 'md5':
@@ -109,8 +118,7 @@ def main(argv=None):
 					original_filename
 				).encode('utf8'))
 
-	cursor.close()
-	connection.close()
+	hashcache.close()
 
 	return 0
 
